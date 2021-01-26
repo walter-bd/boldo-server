@@ -5,16 +5,26 @@ import cookieParser from 'cookie-parser'
 import cors from 'cors'
 import compression from 'compression'
 import session from 'express-session'
+import redis from 'redis'
+import connectRedis from 'connect-redis'
 import Keycloak from 'keycloak-connect'
 import axios from 'axios'
 import mongoose from 'mongoose'
-import { differenceInHours, differenceInMinutes, parseISO } from 'date-fns'
+import { differenceInDays, differenceInMinutes, parseISO } from 'date-fns'
+import { body, param, query } from 'express-validator'
 
 import { createLoginUrl } from './util/kc-helpers'
-
 import Doctor from './models/Doctor'
-import Appointment from './models/Appointment'
-import CoreAppointment from './models/CoreAppointment'
+import Appointment, { IAppointment } from './models/Appointment'
+import CoreAppointment, { ICoreAppointment } from './models/CoreAppointment'
+import {
+  calculateAvailability,
+  handleError,
+  validate,
+  APPOINTMENT_LENGTH,
+  calculateNextAvailability,
+  createToken,
+} from './util/helpers'
 
 // We use axios for queries to the iHub Server
 axios.defaults.baseURL = process.env.IHUB_ADDRESS!
@@ -28,7 +38,7 @@ export const app = express()
 // //////////////////////////////
 //
 //
-const AllowedOrigins = process.env.BOLDO_CORS!.split(",")
+const AllowedOrigins = [process.env.CLIENT_ADDRESS!, 'http://localhost:3000']
 app.use(cors({ origin: AllowedOrigins, credentials: true }))
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
@@ -54,8 +64,17 @@ let kcConfig = {
   'confidential-port': 0,
 }
 
-const memoryStore = new session.MemoryStore()
-app.use(session({ secret: process.env.SECRET!, resave: false, saveUninitialized: true, store: memoryStore }))
+const RedisStore = connectRedis(session)
+const redisClient = redis.createClient(process.env.REDIS_URL!)
+
+app.use(
+  session({
+    secret: process.env.SECRET!,
+    resave: false,
+    saveUninitialized: true,
+    store: new RedisStore({ client: redisClient }),
+  })
+)
 
 // FIXME: We should try if we can configure KC with cookies instead of sessions
 // FIXME: Enable offline_acess scope and make sure we make use of it
@@ -63,7 +82,7 @@ app.use(session({ secret: process.env.SECRET!, resave: false, saveUninitialized:
 // Better to find a way in the client to keep the doctor logged in while using the app?
 export const keycloak = new Keycloak(
   {
-    store: memoryStore,
+    store: RedisStore,
     //scope: 'offline_access',
   },
   kcConfig
@@ -73,6 +92,7 @@ export const keycloak = new Keycloak(
 keycloak.redirectToLogin = () => false
 keycloak.accessDenied = (req, res) => {
   res.status(401).send({ message: createLoginUrl(req, '/login') })
+  // FIXME: Check if we should return something here
 }
 
 app.set('trust proxy', true)
@@ -104,13 +124,10 @@ app.get('/login', keycloak.protect(), (req, res) => {
 })
 
 //
-// PROFILE:
+// DOCTOR PROFILE:
 // Protected Routes for managing profile information
 // GET /profile/doctor - Read doctor details
-// GET /profile/doctor/openHours - Read doctor details
 // POST /profile/doctor - Update doctor details
-// GET /profile/patient - Read patient details
-// POST /profile/patient - Update patient details
 //
 
 app.get('/profile/doctor', keycloak.protect('realm:doctor'), async (req, res) => {
@@ -120,172 +137,227 @@ app.get('/profile/doctor', keycloak.protect('realm:doctor'), async (req, res) =>
 
     const resp = await axios.get('/profile/doctor', { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
 
-    res.send({ ...resp.data, openHours })
-  } catch (err) {
-    console.log(err)
-    res.status(500).send({ message: 'Failed to fetch data' })
-  }
-})
-
-app.get('/profile/doctor/openHours', keycloak.protect('realm:doctor'), async (req, res) => {
-  try {
-    const doctor = await Doctor.findById(req.userId)
-    const openHours = doctor?.openHours || { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] }
-
-    res.send(openHours)
-  } catch (err) {
-    console.log(err)
-    res.sendStatus(500)
-  }
-})
-
-app.post('/profile/doctor', keycloak.protect('realm:doctor'), async (req, res) => {
-  const { openHours, ...ihubPayload } = req.body
-  try {
-    await Doctor.findOneAndUpdate({ _id: req.userId }, { openHours }, { upsert: true })
-
-    await axios.put('/profile/doctor', ihubPayload, { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
-  } catch (err) {
-    if (err.response?.data) {
-      console.log(err.response?.data)
-      return res.status(400).send(err.response.data)
-    } else {
-      console.log(err)
-      return res.sendStatus(500)
-    }
-  }
-
-  res.sendStatus(200)
-})
-
-app.post('/profile/patient', keycloak.protect(), async (req, res) => {
-  const payload = req.body
-  try {
-    await axios.put('/profile/patient', payload, { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
-  } catch (err) {
-    if (err.response) {
-      console.log(err.response.data)
-      return res.status(400).send(err.response.data)
-    } else {
-      console.log(err)
-      return res.sendStatus(500)
-    }
-  }
-
-  res.sendStatus(200)
-})
-
-//
-// APPOINTMENTS for DOCTORS:
-// Protected Routes for managing profile information
-// GET /profile/doctor/appointments - Read appointments of Doctor
-// GET /profile/doctor/appointments/:id - Read appointment of Doctor
-// POST /profile/doctor/appointments/:id - Update appointment of Doctor
-// GET /profile/doctor/appointments/openAppointments - Read appointments of Doctor that have open WaitingRoom
-// POST /profile/doctor/appointments - Create appontment for Doctor
-// DELETE /profile/doctor/appointments/:id - Delete appontment for Doctor
-//
-
-// FIXME: Should be scoped to start and end date
-app.get('/profile/doctor/appointments', keycloak.protect('realm:doctor'), async (req, res) => {
-  try {
-    const appointments = await Appointment.find({ doctorId: req.userId })
-
-    const resp = await axios.get<iHub.Appointment[]>('/profile/doctor/appointments?include=patient', {
-      headers: { Authorization: `Bearer ${getAccessToken(req)}` },
-    })
-
-    const FHIRAppointments = resp.data.map(event => ({ ...event, type: 'Appointment' }))
-
-    res.send([...FHIRAppointments, ...appointments])
-  } catch (err) {
-    console.log(err)
-    res.status(500).send({ message: 'Failed to fetch data' })
-  }
-})
-
-app.get('/profile/doctor/appointments/openAppointments', keycloak.protect('realm:doctor'), async (req, res) => {
-  // FIXME: It seems like KC allows for request using tokens that are timed out already.
-
-  try {
-    // FIXME: Request Should be scoped to start and end date
-    const resp = await axios.get<iHub.Appointment[]>('/profile/doctor/appointments?include=patient', {
-      headers: { Authorization: `Bearer ${getAccessToken(req)}` },
-    })
-
-    const upcomingAppointments = resp.data.filter(appointment => {
-      const minutes = differenceInMinutes(parseISO(appointment.start as any), Date.now())
-      const hours = differenceInHours(parseISO(appointment.start as any), Date.now())
-      return minutes < 15 && hours > -24
-    })
-
-    res.send(upcomingAppointments)
-  } catch (err) {
-    console.log(err)
-    res.status(500).send({ message: 'Failed to fetch data' })
-  }
-})
-
-app.get('/profile/doctor/appointments/:id', keycloak.protect('realm:doctor'), async (req, res) => {
-  try {
-    const resp = await axios.get<iHub.Appointment>(`/profile/doctor/appointments/${req.params.id}?include=patient`, {
-      headers: { Authorization: `Bearer ${getAccessToken(req)}` },
-    })
-
-    const appointment = resp.data
-
-    const minutes = differenceInMinutes(parseISO(appointment.start as any), Date.now())
-    let status = 'upcoming'
-    if (minutes < 15) {
-      const appointmentAddon = await CoreAppointment.findOne({ id: req.params.id })
-      status = appointmentAddon?.status || 'open'
-    }
-    res.send({ ...resp.data, type: 'Appointment', status })
+    res.send({ ...resp.data, openHours, new: !doctor })
   } catch (err) {
     handleError(req, res, err)
   }
 })
 
-app.post('/profile/doctor/appointments', keycloak.protect('realm:doctor'), async (req, res) => {
-  if (!req.userId) return res.sendStatus(500)
-  const { type, name, start, end, description } = req.body
+app.post(
+  '/profile/doctor',
+  keycloak.protect('realm:doctor'),
+  body([
+    'openHours.mon',
+    'openHours.tue',
+    'openHours.wed',
+    'openHours.thu',
+    'openHours.fri',
+    'openHours.sat',
+    'openHours.sun',
+  ]).isArray(),
+  body(['openHours.*.*.start', 'openHours.*.*.end']).isInt().toInt(),
+  async (req, res) => {
+    if (!validate(req, res)) return
 
-  if (type === 'PrivateEvent') {
+    const { openHours, ...ihubPayload } = req.body
+
     try {
-      const appointment = await Appointment.create({ type, name, start, end, description, doctorId: req.userId })
-      res.send(appointment)
+      const resp = await axios.get('/profile/doctor', { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
+      await Doctor.findOneAndUpdate({ _id: req.userId, id: resp.data.id }, { openHours }, { upsert: true })
+
+      await axios.put('/profile/doctor', ihubPayload, { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
+      res.sendStatus(200)
     } catch (err) {
-      console.log(err)
-      return res.sendStatus(500)
+      handleError(req, res, err)
     }
+  }
+)
+
+//
+// PATIENT PROFILE:
+// GET /profile/patient - Read patient details
+// POST /profile/patient - Update patient details
+//
+
+app.get('/profile/patient', keycloak.protect('realm:patient'), async (req, res) => {
+  try {
+    const resp = await axios.get('/profile/patient', { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
+    res.send(resp.data)
+  } catch (err) {
+    handleError(req, res, err)
   }
 })
 
-app.post('/profile/doctor/appointments/:id', keycloak.protect('realm:doctor'), async (req, res) => {
+app.post('/profile/patient', keycloak.protect('realm:patient'), async (req, res) => {
+  const payload = req.body
   try {
-    // Get Appointment and check for access rights
-    const resp = await axios.get<iHub.Appointment>(`/profile/doctor/appointments/${req.params.id}`, {
-      headers: { Authorization: `Bearer ${getAccessToken(req)}` },
-    })
-    const respp = await axios.get<iHub.Appointment>(`/profile/doctor`, {
-      headers: { Authorization: `Bearer ${getAccessToken(req)}` },
-    })
-    if (resp.data.doctorId !== respp.data.id) return res.sendStatus(400)
-    await CoreAppointment.updateOne({ id: req.params.id }, { $set: { status: 'closed' } }, { upsert: true })
+    await axios.put('/profile/patient', payload, { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
     res.sendStatus(200)
   } catch (err) {
     handleError(req, res, err)
   }
 })
+
+//
+// APPOINTMENTS for DOCTORS:
+// Protected routes for managing appointments
+// GET /profile/doctor/appointments - Read doctor appointments
+// POST /profile/doctor/appointments - Create doctor appointment
+// GET /profile/doctor/appointments/:id - Read doctor appointment
+// POST /profile/doctor/appointments/:id - Update doctor appointment
+// DELETE /profile/doctor/appointments/:id - Delete doctor appointment
+//
+
+app.get(
+  '/profile/doctor/appointments',
+  keycloak.protect('realm:doctor'),
+  query(['start', 'end']).isISO8601().optional(),
+  query('status').isString().optional(),
+  async (req, res) => {
+    if (!validate(req, res)) return
+
+    const { status, start, end } = req.query
+
+    try {
+      const { data } = await axios.get<iHub.Appointment[]>(
+        `/profile/doctor/appointments?include=patient${start && end ? `&start=${start}&end=${end}` : ''}`,
+        {
+          headers: { Authorization: `Bearer ${getAccessToken(req)}` },
+        }
+      )
+      const ids = data.map(appointment => appointment.id)
+      const coreAppointments = await CoreAppointment.find({ id: { $in: ids } })
+
+      let FHIRAppointments = [] as (iHub.Appointment & { type: string; status: ICoreAppointment['status'] })[]
+
+      FHIRAppointments = coreAppointments.map(appointment => {
+        const FHIRAppointment = data.find(app => app.id === appointment.id)
+        if (!FHIRAppointment) throw new Error(`FHIR Appointment must exist but not found for ID: ${appointment.id}!`)
+
+        const minutes = differenceInMinutes(parseISO(FHIRAppointment.start as any), Date.now())
+        if (minutes < 15 && appointment.status === 'upcoming') {
+          return { ...FHIRAppointment, type: 'Appointment', status: 'open' }
+        } else {
+          return { ...FHIRAppointment, type: 'Appointment', status: appointment.status }
+        }
+      })
+
+      let token = ''
+      if (status) {
+        FHIRAppointments = FHIRAppointments.filter(appointment => appointment.status === status)
+        if (status === 'open') {
+          const ids = FHIRAppointments.map(app => app.id)
+          token = createToken(ids, 'doctor')
+        }
+      }
+
+      let appointments = [] as IAppointment[]
+      if (!status) appointments = await Appointment.find({ doctorId: req.userId })
+
+      res.send({ appointments: [...FHIRAppointments, ...appointments], token })
+    } catch (err) {
+      handleError(req, res, err)
+    }
+  }
+)
+
+app.post(
+  '/profile/doctor/appointments',
+  keycloak.protect('realm:doctor'),
+  body('type').isIn(['PrivateEvent']),
+  body('name').isString(),
+  body(['start', 'end']).isISO8601(),
+  body('description').isString().optional(),
+  async (req, res) => {
+    if (!validate(req, res)) return
+    if (!req.userId) return res.sendStatus(500)
+
+    const { type, name, start, end, description } = req.body
+
+    try {
+      const appointment = await Appointment.create({ type, name, start, end, description, doctorId: req.userId })
+      res.send(appointment)
+    } catch (err) {
+      handleError(req, res, err)
+    }
+  }
+)
+
+app.get('/profile/doctor/appointments/:id', keycloak.protect('realm:doctor'), async (req, res) => {
+  const { id } = req.params
+
+  try {
+    const { data: FHIRAppointment } = await axios.get<iHub.Appointment>(
+      `/profile/doctor/appointments/${id}?include=patient`,
+      {
+        headers: { Authorization: `Bearer ${getAccessToken(req)}` },
+      }
+    )
+
+    const coreAppointment = await CoreAppointment.findOne({ id })
+    if (!coreAppointment) throw new Error(`Core Appointment must exist but not found for ID: ${id}!`)
+
+    let appointment
+    const minutes = differenceInMinutes(parseISO(FHIRAppointment.start as any), Date.now())
+    if (minutes < 15 && coreAppointment.status === 'upcoming') {
+      appointment = { ...FHIRAppointment, type: 'Appointment', status: 'open' }
+    } else {
+      appointment = { ...FHIRAppointment, type: 'Appointment', status: coreAppointment.status }
+    }
+
+    let token = ''
+    if (appointment.status === 'open') token = createToken([appointment.id], 'doctor')
+
+    res.send({ ...appointment, token })
+  } catch (err) {
+    handleError(req, res, err)
+  }
+})
+
+app.post(
+  '/profile/doctor/appointments/:id',
+  keycloak.protect('realm:doctor'),
+  param('id').isString(),
+  body('status').isIn(['closed', 'open']),
+  async (req, res) => {
+    if (!validate(req, res)) return
+
+    const { status } = req.body
+    const { id } = req.params
+
+    try {
+      // Get Appointment and check for access rights
+      const req1 = axios.get<iHub.Appointment>(`/profile/doctor/appointments/${id}`, {
+        headers: { Authorization: `Bearer ${getAccessToken(req)}` },
+      })
+      const req2 = axios.get<iHub.Appointment>(`/profile/doctor`, {
+        headers: { Authorization: `Bearer ${getAccessToken(req)}` },
+      })
+      const [resp, respp] = await Promise.all([req1, req2])
+
+      if (resp.data.doctorId !== respp.data.id) return res.sendStatus(403)
+
+      let appointment = await CoreAppointment.findOne({ id })
+      if (!appointment) throw new Error(`Core Appointment must exist but not found for ID: ${id}!`)
+
+      if (appointment.status === 'locked') return res.status(400).send({ message: 'Appointment locked' })
+
+      const update = await CoreAppointment.updateOne({ id }, { status })
+      if (update.nModified !== 1) return res.status(400).send({ message: 'Update not successful' })
+
+      res.sendStatus(200)
+    } catch (err) {
+      handleError(req, res, err)
+    }
+  }
+)
 
 app.delete('/profile/doctor/appointments/:id', keycloak.protect('realm:doctor'), async (req, res) => {
   try {
     await Appointment.deleteOne({ _id: req.params.id, doctorId: req.userId })
     res.sendStatus(200)
-  } catch (error) {
-    console.log(error)
-    if (error.message) return res.status(400).send({ message: error.message })
-    res.sendStatus(500)
+  } catch (err) {
+    handleError(req, res, err)
   }
 })
 
@@ -293,60 +365,108 @@ app.delete('/profile/doctor/appointments/:id', keycloak.protect('realm:doctor'),
 // APPOINTMENTS for PATIENTS:
 // Protected Routes for managing profile information
 // GET /profile/patient/appointments - Read appointments of Patient
-// POST /profile/patient/appointments - Create appontment for Patient
-
+// POST /profile/patient/appointments - Create appointment for Patient
 //
+
 app.get('/profile/patient/appointments', keycloak.protect('realm:patient'), async (req, res) => {
   try {
-    const resp = await axios.get<iHub.Appointment[]>('/profile/patient/appointments?include=doctor', {
+    const { data } = await axios.get<iHub.Appointment[]>('/profile/patient/appointments?include=doctor', {
       headers: { Authorization: `Bearer ${getAccessToken(req)}` },
     })
 
-    const ids = resp.data.map(app => app.id)
-    const appointmentsAddon = await CoreAppointment.find({ id: { $in: ids } })
+    const ids = data.map(app => app.id)
+    const coreAppointments = await CoreAppointment.find({ id: { $in: ids } })
 
-    const FHIRAppointments = resp.data.map(event => {
-      let status = 'upcoming'
-      const minutes = differenceInMinutes(parseISO(event.start as any), Date.now())
-      if (minutes < 15) {
-        const appointmentAddon = appointmentsAddon.find(app => app.id === event.id)
-        status = appointmentAddon?.status || 'open'
+    const FHIRAppointments = coreAppointments.map(appointment => {
+      const FHIRAppointment = data.find(app => app.id === appointment.id)
+      if (!FHIRAppointment) throw new Error(`FHIR Appointment must exist but not found for ID: ${appointment.id}!`)
+
+      const minutes = differenceInMinutes(parseISO(FHIRAppointment.start as any), Date.now())
+      if (minutes < 15 && appointment.status === 'upcoming') {
+        return { ...FHIRAppointment, type: 'Appointment', status: 'open' }
+      } else {
+        return { ...FHIRAppointment, type: 'Appointment', status: appointment.status }
       }
-      return { ...event, type: 'Appointment', status }
     })
 
-    res.send(FHIRAppointments)
+    res.send({ appointments: FHIRAppointments, token: '' })
   } catch (err) {
-    console.log(err)
-    res.status(500).send({ message: 'Failed to fetch data' })
+    handleError(req, res, err)
   }
 })
 
-app.post('/profile/patient/appointments', keycloak.protect(), async (req, res) => {
-  const payload = req.body
-
-  const end = new Date(payload.start)
-  end.setMinutes(end.getMinutes() + 30)
+app.get('/profile/patient/appointments/:id', keycloak.protect('realm:patient'), async (req, res) => {
+  const { id } = req.params
 
   try {
-    const resp = await axios.post(
-      '/profile/patient/appointments',
-      { ...payload, end: end.toISOString().replace('Z', '-0000') },
+    const { data: FHIRAppointment } = await axios.get<iHub.Appointment>(
+      `/profile/patient/appointments/${id}?include=doctor`,
       {
         headers: { Authorization: `Bearer ${getAccessToken(req)}` },
       }
     )
-    res.send(resp.data)
-  } catch (err) {
-    if (err.response) {
-      console.log(err.response.data)
-      return res.status(400).send(err.response.data)
+
+    const coreAppointment = await CoreAppointment.findOne({ id })
+    if (!coreAppointment) throw new Error(`Core Appointment must exist but not found for ID: ${id}!`)
+
+    let appointment
+    const minutes = differenceInMinutes(parseISO(FHIRAppointment.start as any), Date.now())
+    if (minutes < 15 && coreAppointment.status === 'upcoming') {
+      appointment = { ...FHIRAppointment, type: 'Appointment', status: 'open' }
     } else {
-      console.log(err)
-      return res.sendStatus(500)
+      appointment = { ...FHIRAppointment, type: 'Appointment', status: coreAppointment.status }
     }
+
+    let token = ''
+    if (appointment.status === 'open') token = createToken([appointment.id], 'patient')
+
+    res.send({ ...appointment, token })
+  } catch (err) {
+    handleError(req, res, err)
   }
 })
+
+app.post(
+  '/profile/patient/appointments',
+  keycloak.protect('realm:patient'),
+  body('doctorId').isString(),
+  body('start').isISO8601(),
+  async (req, res) => {
+    if (!validate(req, res)) return
+
+    const { start, doctorId } = req.body
+
+    const startDate = new Date(start)
+    const endDate = new Date(start)
+    endDate.setMilliseconds(endDate.getMilliseconds() + APPOINTMENT_LENGTH)
+
+    const now = new Date()
+    now.setMilliseconds(now.getMilliseconds() + APPOINTMENT_LENGTH)
+    if (startDate < now) return res.status(400).send({ message: "'start' has to be at least 30 minutes in the future" })
+
+    try {
+      const availabilities = await calculateAvailability(doctorId, startDate, endDate)
+      const available = availabilities.map(date => Date.parse(date)).includes(Date.parse(start))
+      if (!available) return res.status(400).send({ message: 'timeslot is not available for booking' })
+
+      const appointment = await CoreAppointment.create({ date: startDate, status: 'upcoming', id: '_' })
+
+      const resp = await axios.post(
+        '/profile/patient/appointments',
+        { doctorId, start, end: endDate.toISOString() },
+        {
+          headers: { Authorization: `Bearer ${getAccessToken(req)}` },
+        }
+      )
+      const x = await CoreAppointment.findByIdAndUpdate(appointment._id, { $set: { id: resp.data.id } })
+
+      // FIXME: double check for double booking
+      res.send(resp.data)
+    } catch (err) {
+      handleError(req, res, err)
+    }
+  }
+)
 
 //
 // Doctor
@@ -359,23 +479,23 @@ app.get('/doctors', async (req, res) => {
   try {
     const queryString = req.originalUrl.split('?')[1]
 
-    const resp = await axios.get<iHub.Doctor[]>(`/doctors${queryString ? `?${queryString}` : ''}`)
+    const resp = await axios.get<{ items: iHub.Doctor[]; total: number }>(
+      `/doctors${queryString ? `?${queryString}` : ''}`
+    )
 
-    const createRandomFutureDate = () => {
-      const date = new Date()
-      date.setDate(date.getDate() + Math.floor(Math.random() * 10) + Math.floor(Math.random() * 10))
-      return date
-    }
+    // FIXME: this currently creates one worker per doctor with huge overhead.
+    // Probably best to move this into a own worker.
 
-    const doctorsWithNextAvailability = resp.data.map(doctor => ({
-      ...doctor,
-      nextAvailability: createRandomFutureDate(),
-    }))
+    const doctorsWithNextAvailability = await Promise.all(
+      resp.data.items.map(async doctor => ({
+        ...doctor,
+        nextAvailability: await calculateNextAvailability(doctor.id),
+      }))
+    )
 
-    res.send(doctorsWithNextAvailability)
+    res.send({ items: doctorsWithNextAvailability, total: resp.data.total })
   } catch (err) {
-    console.log(err)
-    res.sendStatus(500)
+    handleError(req, res, err)
   }
 })
 
@@ -384,41 +504,49 @@ app.get('/doctors/:id', async (req, res) => {
     const resp = await axios.get<iHub.Doctor>(`/doctors/${req.params.id}`)
     res.send(resp.data)
   } catch (err) {
-    console.log(err)
-    res.sendStatus(500)
+    handleError(req, res, err)
   }
 })
 
-app.get('/doctors/:id/availability', async (req, res) => {
-  try {
-    const resp = await axios.get<iHub.Doctor>(`/doctors/${req.params.id}`)
-    if (!resp.data) return res.status(400).send({ message: 'No Doctor with this id' })
+app.get(
+  '/doctors/:id/availability',
+  param('id').isString(),
+  query(['start', 'end']).isISO8601(),
+  async (req: express.Request, res: express.Response) => {
+    if (!validate(req, res)) return
 
-    const minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
-    const hours = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    const { start, end } = req.query
+    const { id: doctorId } = req.params
 
-    const createRandomAvailability = () => {
-      const date = new Date()
-      date.setDate(date.getDate() + Math.floor(Math.random() * 10) + Math.floor(Math.random() * 10))
-      date.setHours(hours[(hours.length * Math.random()) | 0])
-      date.setMinutes(minutes[(minutes.length * Math.random()) | 0])
-      date.setSeconds(0)
-      date.setMilliseconds(0)
-      return date
+    try {
+      let startDate = new Date(start as string)
+      let endDate = new Date(end as string)
+
+      const now = new Date()
+      now.setMilliseconds(now.getMilliseconds() + APPOINTMENT_LENGTH)
+
+      if (startDate < now) startDate = now
+      if (endDate < startDate)
+        return res.status(400).send({ message: 'End Date has to be larger than start and in the future' })
+
+      if (differenceInDays(endDate, startDate) > 30) {
+        endDate = new Date(startDate)
+        endDate.setDate(endDate.getDate() + 31)
+      }
+
+      const availabilities = await calculateAvailability(doctorId, startDate, endDate)
+
+      const nextAvailability = await calculateNextAvailability(doctorId)
+
+      // FIXME: nextAvailability is runing the whole loop again.
+      // Could be done in one loop in the case that start = now
+      // Also starts two workers. Could start one
+      res.send({ availabilities, nextAvailability })
+    } catch (err) {
+      handleError(req, res, err)
     }
-
-    const availabilities = []
-
-    for (let i = 0; i <= 50; i++) {
-      availabilities.push(createRandomAvailability())
-    }
-
-    res.send({ ...resp.data, availabilities, nextAvailability: createRandomAvailability() })
-  } catch (err) {
-    console.log(err)
-    res.sendStatus(500)
   }
-})
+)
 
 //
 // Utils:
@@ -430,53 +558,21 @@ app.get('/presigned', keycloak.protect(), async (req, res) => {
     const resp = await axios.get('/s3/presigned', { headers: { Authorization: `Bearer ${getAccessToken(req)}` } })
     res.send(resp.data)
   } catch (err) {
-    console.log(err.response?.data || err)
-    return res.sendStatus(500)
+    handleError(req, res, err)
   }
 })
 
 //
-// Forward all other GET endpoints:
-// EXAMPLES:
+// OTHER:
 // GET /specializations - List doctor specializations
-// GET /profile/patient - Read patient details
-// POST /profile/patient - Update patient details
 //
 
-app.get('*', async (req, res) => {
-  const token = getAccessToken(req)
+app.get('/specializations', async (req, res) => {
   try {
-    const resp = await axios.get(req.originalUrl, { ...(!!token && { headers: { Authorization: `Bearer ${token}` } }) })
-    return res.send(resp.data)
+    const resp = await axios.get('/specializations')
+    res.send(resp.data)
   } catch (err) {
-    if (err.response) {
-      if (err.response.status === 401) return res.status(401).send({ message: createLoginUrl(req, '/login') })
-      console.log('axios:', err.response.data || err.message)
-      return res.status(err.response.status).send(err.response.data)
-    } else {
-      console.log(err)
-      return res.sendStatus(500)
-    }
-  }
-})
-
-app.post('*', async (req, res) => {
-  const payload = req.body || {}
-  const token = getAccessToken(req)
-  try {
-    const resp = await axios.put(req.originalUrl, payload, {
-      ...(!!token && { headers: { Authorization: `Bearer ${token}` } }),
-    })
-    return res.send(resp.data)
-  } catch (err) {
-    if (err.response) {
-      if (err.response.status === 401) return res.status(401).send({ message: createLoginUrl(req, '/login') })
-      console.log('axios:', err.response.data || err.message)
-      return res.status(err.response.status).send(err.response.data)
-    } else {
-      console.log(err)
-      return res.sendStatus(500)
-    }
+    handleError(req, res, err)
   }
 })
 
@@ -504,24 +600,4 @@ if (require.main === module) {
       console.log(err)
       process.exit(1)
     })
-}
-
-//
-//
-// //////////////////////////////
-//        HELPER
-// //////////////////////////////
-//
-//
-
-const handleError = (req: express.Request, res: express.Response, err: any) => {
-  console.log(err.message, err.name)
-  if (err.response) {
-    if (err.response.status === 401) return res.status(401).send({ message: createLoginUrl(req, '/login') })
-    console.log('axios:', err.response.data || err.message)
-    return res.status(err.response.status).send(err.response.data)
-  } else {
-    console.log(err)
-    return res.sendStatus(500)
-  }
 }

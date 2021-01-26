@@ -2,7 +2,7 @@
 
 Boldo can be found in any Paraguayan household. It is a magic tea that can calm all kind of stomachache.
 
-This is the server for Boldo - a telemedicine solution for doctors and patients. 
+This is the server for Boldo - a telemedicine solution for doctors and patients.
 
 The server exposes APIs that are consumed by the web app and the mobile app.
 
@@ -12,7 +12,8 @@ The server exposes APIs that are consumed by the web app and the mobile app.
 
    - node.js (v12 or newer)
    - mongoDB (v4.2 or newer)
-   - Optional dependency: 
+   - Redis
+   - Optional dependency:
      - Docker (v19 or newer) for building the image
 
 2. Install dependencies: `npm i`
@@ -20,19 +21,20 @@ The server exposes APIs that are consumed by the web app and the mobile app.
 3. Create a `.env` file in the project's root folder and add these contents:
 
    ```
-   SECRET = secure_server_secret
+   SECRET = Secure Secret for Sessions
    MONGODB_URI = mongodb://localhost:27017/boldo
-   
+   REDIS_URL = 127.0.0.1:6379
+   PRIVATE_KEY = RSA256 Private Key (e.g. `-----BEGIN RSA PRIVATE KEY-----\nMI...`)
+
+   IHUB_ADDRESS = https://sso-test.pti.org.py/api
+
    # ###################### Online ######################
    # CLIENT_ADDRESS = https://boldo.penguin.software
-   # KEYCLOAK_ADDRESS = https://sso-test.pti.org.py/auth
-   IHUB_ADDRESS = https://sso-test.pti.org.py/api
-   # BOLDO_CORS = https://boldo.penguin.software
-   
+   KEYCLOAK_ADDRESS = https://sso-test.pti.org.py/auth
+
    # ###################### Local ######################
    CLIENT_ADDRESS = http://localhost:3000
-   KEYCLOAK_ADDRESS = http://localhost:8080/auth
-   BOLDO_CORS = https://localhost:3000
+   # KEYCLOAK_ADDRESS = http://localhost:8080/auth
    ```
 
 4. Ensure the server runs in the timezone `America/Asuncion`!
@@ -49,11 +51,15 @@ docker build -t boldo-server .
 
 Remember to set your `.env` file.
 
- After that you can test it running the following command:
+After that you can test it running the following command:
 
 ```bash
 docker run --rm -it -p 8008:8008 boldo-server
 ```
+
+## Data
+
+This project has several scripts to run migrations or timed jobs. Have a look at [DATA](/DATA.md) to learn more.
 
 ## Contributing
 
